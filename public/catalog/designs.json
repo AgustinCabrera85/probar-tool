@@ -1,0 +1,7 @@
+{
+  "designs": [
+    { "id": "nude", "name": "Nude", "thumb": "/catalog/nails/unia_nude.png", "image": "/catalog/nails/unia_nude.png" },
+    { "id": "french", "name": "French", "thumb": "/catalog/nails/unia_azul.png", "image": "/catalog/nails/unia_azul.png" },
+    { "id": "glitter", "name": "Glitter", "thumb": "/catalog/nails/unia_red.png", "image": "/catalog/nails/unia_red.png" }
+  ]
+}
