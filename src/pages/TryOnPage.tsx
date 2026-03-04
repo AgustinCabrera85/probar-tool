@@ -52,6 +52,12 @@ export default function TryOnPage() {
   const [tab, setTab] = useState<TabKey>("designs");
   const [length01, setLength01] = useState(0.35);
   const [isFreeze, setIsFreeze] = useState(false);
+  const [cameraFacing, setCameraFacing] = useState<"user" | "environment">("environment");
+  const cameraFacingRef = useRef<"user" | "environment">("environment");
+
+useEffect(() => {
+  cameraFacingRef.current = cameraFacing;
+}, [cameraFacing]);
 
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">(
     "idle"
@@ -152,6 +158,7 @@ export default function TryOnPage() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
+          facingMode: { ideal: cameraFacingRef.current },
           width: { ideal: 1280 },
           height: { ideal: 720 },
           // en mobile podés forzar trasera:
@@ -354,6 +361,21 @@ export default function TryOnPage() {
 
     ctx.restore();
   }
+  async function restartCamera() {
+  // detener cámara actual
+  const v = videoRef.current;
+  if (v?.srcObject) {
+    (v.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+    v.srcObject = null;
+  }
+
+  // reset suave (sin tocar timestamps)
+  softResetTracking();
+  setDetected(false);
+
+  // volver a iniciar con el nuevo facingMode
+  await startCamera();
+}
 
   function drawHud(ctx: CanvasRenderingContext2D, detected: boolean, freeze: boolean) {
     ctx.save();
@@ -488,6 +510,18 @@ export default function TryOnPage() {
               className="rounded-xl bg-white px-4 py-3 text-sm font-semibold text-zinc-950 shadow-lg hover:bg-white/90"
             >
               Capturar
+            </button>
+            <button
+              onClick={async () => {
+                setCameraFacing((prev) => (prev === "environment" ? "user" : "environment"));
+                // espera un tick para que el ref se actualice
+                setTimeout(() => {
+                  restartCamera();
+                }, 0);
+              }}
+              className="rounded-xl bg-zinc-900/70 px-4 py-3 text-sm font-semibold border border-white/10 text-white"
+            >
+              {cameraFacing === "environment" ? "Frontal" : "Trasera"}
             </button>
           </div>
         )}
