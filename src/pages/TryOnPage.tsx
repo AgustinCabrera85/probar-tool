@@ -9,12 +9,12 @@ type Catalog = { designs: Design[] };
 
 type TabKey = "designs" | "length" | "settings";
 
-const FINGER_TIPS = [
-  { tip: 4, dip: 3 }, // thumb
-  { tip: 8, dip: 7 }, // index
-  { tip: 12, dip: 11 }, // middle
-  { tip: 16, dip: 15 }, // ring
-  { tip: 20, dip: 19 }, // pinky
+const FINGERS = [
+  { name: "thumb", tip: 4, dip: 3 },
+  { name: "index", tip: 8, dip: 7 },
+  { name: "middle", tip: 12, dip: 11 },
+  { name: "ring", tip: 16, dip: 15 },
+  { name: "pinky", tip: 20, dip: 19 },
 ] as const;
 
 function useImage(url: string | null) {
@@ -325,7 +325,13 @@ useEffect(() => {
       return { x: sx * c.width, y: sy * c.height };
     });
 
-    const fingers = FINGER_TIPS.map((f) => ({
+    const dist = (a: V2, b: V2) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    // ancho de palma (index_mcp 5 ↔ pinky_mcp 17)
+    const palmWidthPx = dist(ptsPx[5], ptsPx[17]);
+
+    const fingers = FINGERS.map((f) => ({
+      name: f.name,
       tip: ptsPx[f.tip],
       dip: ptsPx[f.dip],
     }));
@@ -334,9 +340,12 @@ useEffect(() => {
     if (img) {
       drawNails2D(ctx, img, fingers, {
         length01: clamp(lengthRef.current, 0, 1),
-        baseWidthPx: 44,
+        baseWidthPx: 44,      // fallback (se mezcla con palmWidth)
         baseLengthPx: 84,
-        insetPx: 12,
+        insetPx: 4,
+
+        palmWidthPx,          // ✅ nuevo (auto width)
+        autoWidthWeight: 0.75 // ✅ recomendado (0.6–0.85)
       });
     }
 
