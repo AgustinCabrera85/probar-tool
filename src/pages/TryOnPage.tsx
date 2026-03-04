@@ -67,15 +67,16 @@ export default function TryOnPage() {
   // ✅ Loop gate (no stale closure)
   const readyRef = useRef(false);
 
-  // smoothing
+  // smoothing + lost-hand
   const smRef = useRef<Record<string, number | null>>({});
+  const lostRef = useRef(0);
 
-  // ✅ Monotonic timestamp for MediaPipe (fixes "Packet timestamp mismatch")
-  const tsRef = useRef(0);
+  // ✅ Monotonic timestamp for MediaPipe (NEVER reset while graph alive)
+  const tsRef = useRef(1);
   const lastPerfRef = useRef(0);
 
-  // ✅ Lost-hand counter to soft-reset timestamps after a while
-  const lostRef = useRef(0);
+  // prevent re-render spam
+  const handDetectedRef = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -88,6 +89,31 @@ export default function TryOnPage() {
         setCatalog({ designs: [] });
       }
     })();
+  }, []);
+
+  function stopLoop() {
+    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+  }
+
+  function cleanupCamera() {
+    const v = videoRef.current;
+    if (!v) return;
+    const s = v.srcObject as MediaStream | null;
+    if (s) s.getTracks().forEach((t) => t.stop());
+    v.srcObject = null;
+  }
+
+  useEffect(() => {
+    return () => {
+      readyRef.current = false;
+      stopLoop();
+      cleanupCamera();
+      try {
+        landmarkerRef.current?.close?.();
+      } catch {}
+      landmarkerRef.current = null;
+    };
   }, []);
 
   async function startCamera() {
@@ -116,20 +142,29 @@ export default function TryOnPage() {
         v.addEventListener("loadeddata", () => resolve(), { once: true });
       });
 
-      // tracker
+      // (re)create tracker
+      try {
+        landmarkerRef.current?.close?.();
+      } catch {}
       landmarkerRef.current = await createHandTracker();
 
-      // freeze buffer
       if (!freezeCanvasRef.current) {
         freezeCanvasRef.current = document.createElement("canvas");
       }
 
-      // reset loop + timestamps
+      // reset local state (NOT timestamps)
       stopLoop();
       readyRef.current = true;
-      tsRef.current = 0;
-      lastPerfRef.current = 0;
+
+      smRef.current = {};
       lostRef.current = 0;
+
+      handDetectedRef.current = false;
+      setHandDetected(false);
+
+      // ✅ DO NOT reset tsRef/current to 0; keep monotonic
+      if (tsRef.current < 1) tsRef.current = 1;
+      lastPerfRef.current = 0;
 
       setStatus("ready");
       loop();
@@ -139,27 +174,6 @@ export default function TryOnPage() {
       setStatus("error");
     }
   }
-
-  function stopLoop() {
-    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
-  }
-
-  function cleanupCamera() {
-    const v = videoRef.current;
-    if (!v) return;
-    const s = v.srcObject as MediaStream | null;
-    if (s) s.getTracks().forEach((t) => t.stop());
-    v.srcObject = null;
-  }
-
-  useEffect(() => {
-    return () => {
-      readyRef.current = false;
-      stopLoop();
-      cleanupCamera();
-    };
-  }, []);
 
   function ensureCanvasSize() {
     const v = videoRef.current;
@@ -206,17 +220,23 @@ export default function TryOnPage() {
     lastPerfRef.current = p;
 
     // clamp delta to avoid huge jumps (tab switch / lag)
-    tsRef.current += Math.min(Math.max(delta, 0), 33);
+    tsRef.current += Math.min(Math.max(delta, 0), 50);
 
+    if (tsRef.current < 1) tsRef.current = 1;
     return tsRef.current;
   }
 
   function softResetTracking() {
-  smRef.current = {};
-  lostRef.current = 0;
-  tsRef.current = 0;
-  lastPerfRef.current = 0;
-}
+    // ✅ Safe resets: do NOT touch tsRef while landmarker is alive
+    smRef.current = {};
+    lostRef.current = 0;
+  }
+
+  function setDetected(d: boolean) {
+    if (handDetectedRef.current === d) return;
+    handDetectedRef.current = d;
+    setHandDetected(d);
+  }
 
   function loop() {
     rafRef.current = requestAnimationFrame(loop);
@@ -243,29 +263,42 @@ export default function TryOnPage() {
     const landmarker = landmarkerRef.current;
     if (!landmarker) return;
 
-    // ✅ monotonic timestamp fixes MediaPipe graph errors
     const nowMs = nextMonotonicTimestampMs();
 
     let res: ReturnType<typeof detectHands> | null = null;
-
     try {
       res = detectHands(landmarker, v, nowMs);
     } catch (e) {
-      // If MediaPipe throws (rare), reset timestamps and keep running
-      tsRef.current = 0;
-      lastPerfRef.current = 0;
+      // If MediaPipe throws, we can recreate tracker later (but keep UI alive)
       res = null;
     }
 
     if (!res) {
       lostRef.current += 1;
-      if (handDetected !== false) setHandDetected(false);
+      setDetected(false);
 
-      // ✅ After ~1s without hand, soft-reset timestamps
-      if (lostRef.current > 30) {
-        tsRef.current = 0;
-        lastPerfRef.current = 0;
+      // after a short loss, clear smoothing so a new hand doesn't inherit old points
+      if (lostRef.current === 10) {
+        smRef.current = {};
+      }
+
+      // optional: if lost for a long time, recreate the tracker (hard reset)
+      // This is safe and avoids rare "stuck" states. It DOES NOT require timestamp resets.
+      if (lostRef.current > 90) {
         lostRef.current = 0;
+        smRef.current = {};
+        lastPerfRef.current = 0;
+        try {
+          landmarkerRef.current?.close?.();
+        } catch {}
+        // Recreate asynchronously without blocking loop
+        createHandTracker()
+          .then((lm) => {
+            landmarkerRef.current = lm;
+            lastPerfRef.current = 0;
+            // keep tsRef monotonic; do not reset
+          })
+          .catch(() => {});
       }
 
       drawGuide(ctx);
@@ -274,7 +307,7 @@ export default function TryOnPage() {
     }
 
     lostRef.current = 0;
-    if (handDetected !== true) setHandDetected(true);
+    setDetected(true);
 
     const ptsPx: V2[] = res.landmarks.map((p, idx) => {
       const keyX = `x${idx}`;
@@ -298,13 +331,11 @@ export default function TryOnPage() {
 
     if (nailImg) {
       drawNails2D(ctx, nailImg, fingers, {
-      length01: clamp(length01, 0, 1),
-      baseWidthPx: 44,
-      baseLengthPx: 84,
-      insetPx: 12,
-      tipOutsetPx: 1,
-      lateralOffsetPx: 0,
-});
+        length01: clamp(length01, 0, 1),
+        baseWidthPx: 44,
+        baseLengthPx: 84,
+        insetPx: 12,
+      });
     }
 
     drawHud(ctx, true, isFreeze);
@@ -329,7 +360,11 @@ export default function TryOnPage() {
     ctx.restore();
   }
 
-  function drawHud(ctx: CanvasRenderingContext2D, detected: boolean, freeze: boolean) {
+  function drawHud(
+    ctx: CanvasRenderingContext2D,
+    detected: boolean,
+    freeze: boolean
+  ) {
     ctx.save();
     ctx.globalAlpha = 0.95;
     ctx.fillStyle = "rgba(0,0,0,0.35)";
@@ -346,7 +381,9 @@ export default function TryOnPage() {
 
     ctx.beginPath();
     ctx.arc(380, 53, 10, 0, Math.PI * 2);
-    ctx.fillStyle = detected ? "rgba(60,220,120,0.95)" : "rgba(255,80,80,0.95)";
+    ctx.fillStyle = detected
+      ? "rgba(60,220,120,0.95)"
+      : "rgba(255,80,80,0.95)";
     ctx.fill();
 
     ctx.restore();
@@ -375,11 +412,9 @@ export default function TryOnPage() {
       const next = !prev;
       if (next) {
         captureFreezeFrame();
-        // reset monotonic clock to avoid rare jumps
-        tsRef.current = 0;
-        lastPerfRef.current = 0;
-        lostRef.current = 0;
       }
+      // safe soft reset (no timestamps)
+      softResetTracking();
       return next;
     });
   }
@@ -399,7 +434,9 @@ export default function TryOnPage() {
     <div className="h-full w-full bg-zinc-950 text-white">
       {/* TOP BAR */}
       <div className="fixed top-0 left-0 right-0 z-20 flex items-center justify-between px-4 py-3 bg-gradient-to-b from-black/70 to-transparent">
-        <div className="text-sm font-semibold tracking-wide">probAR • probar-tool</div>
+        <div className="text-sm font-semibold tracking-wide">
+          probAR • probar-tool
+        </div>
         <div className="text-xs text-white/70">
           {status === "ready" ? "Listo" : status === "loading" ? "Cargando…" : ""}
         </div>
@@ -413,7 +450,10 @@ export default function TryOnPage() {
           playsInline
           muted
         />
-        <canvas ref={canvasRef} className="absolute inset-0 h-full w-full object-cover" />
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 h-full w-full object-cover"
+        />
 
         {/* CTA inicial */}
         {status !== "ready" && (
@@ -435,7 +475,8 @@ export default function TryOnPage() {
 
               {status === "error" && (
                 <div className="mt-3 text-sm text-red-300">
-                  No se pudo acceder a la cámara o cargar el modelo. Probá con permisos habilitados.
+                  No se pudo acceder a la cámara o cargar el modelo. Probá con
+                  permisos habilitados.
                 </div>
               )}
 
@@ -452,7 +493,9 @@ export default function TryOnPage() {
             <button
               onClick={onToggleFreeze}
               className={`rounded-xl px-4 py-3 text-sm font-semibold shadow-lg border border-white/10 ${
-                isFreeze ? "bg-emerald-500/90 text-black" : "bg-zinc-900/70 text-white"
+                isFreeze
+                  ? "bg-emerald-500/90 text-black"
+                  : "bg-zinc-900/70 text-white"
               }`}
             >
               {isFreeze ? "Freeze ON" : "Freeze"}
@@ -472,9 +515,21 @@ export default function TryOnPage() {
           <div className="absolute bottom-0 left-0 right-0 z-20">
             <div className="mx-auto w-full max-w-2xl rounded-t-3xl border border-white/10 bg-zinc-950/80 backdrop-blur">
               <div className="flex items-center gap-2 px-4 pt-3">
-                <TabButton active={tab === "designs"} onClick={() => setTab("designs")} label="Diseños" />
-                <TabButton active={tab === "length"} onClick={() => setTab("length")} label="Largo" />
-                <TabButton active={tab === "settings"} onClick={() => setTab("settings")} label="Ajustes" />
+                <TabButton
+                  active={tab === "designs"}
+                  onClick={() => setTab("designs")}
+                  label="Diseños"
+                />
+                <TabButton
+                  active={tab === "length"}
+                  onClick={() => setTab("length")}
+                  label="Largo"
+                />
+                <TabButton
+                  active={tab === "settings"}
+                  onClick={() => setTab("settings")}
+                  label="Ajustes"
+                />
                 <div className="ml-auto text-xs text-white/60">
                   {handDetected ? "Mano ✓" : "Buscando…"}
                 </div>
@@ -493,12 +548,7 @@ export default function TryOnPage() {
                           key={d.id}
                           onClick={() => {
                             setSelectedDesignId(d.id);
-
-                            // ✅ soft reset para que no se "pegue" al cambiar diseño
-                            smRef.current = {};
-                            lostRef.current = 0;
-                            tsRef.current = 0;
-                            lastPerfRef.current = 0;
+                            softResetTracking();
                           }}
                           className={`rounded-2xl border p-2 text-left transition ${
                             selectedDesign?.id === d.id
@@ -507,16 +557,23 @@ export default function TryOnPage() {
                           }`}
                         >
                           <div className="aspect-square w-full overflow-hidden rounded-xl bg-black/20">
-                            <img src={d.thumb} alt={d.name} className="h-full w-full object-cover" />
+                            <img
+                              src={d.thumb}
+                              alt={d.name}
+                              className="h-full w-full object-cover"
+                            />
                           </div>
-                          <div className="mt-2 text-xs font-semibold">{d.name}</div>
+                          <div className="mt-2 text-xs font-semibold">
+                            {d.name}
+                          </div>
                         </button>
                       ))}
                     </div>
 
                     {!catalog?.designs?.length && (
                       <div className="text-sm text-red-200">
-                        No se pudo cargar el catálogo. Revisá /public/catalog/designs.json
+                        No se pudo cargar el catálogo. Revisá
+                        /public/catalog/designs.json
                       </div>
                     )}
                   </div>
@@ -524,12 +581,16 @@ export default function TryOnPage() {
 
                 {tab === "length" && (
                   <div>
-                    <div className="text-sm text-white/70">Ajustá el largo (visual, no medido).</div>
+                    <div className="text-sm text-white/70">
+                      Ajustá el largo (visual, no medido).
+                    </div>
 
                     <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
                       <div className="flex items-center justify-between">
                         <div className="text-sm font-semibold">Largo</div>
-                        <div className="text-xs text-white/60">{labelFromLength(length01)}</div>
+                        <div className="text-xs text-white/60">
+                          {labelFromLength(length01)}
+                        </div>
                       </div>
 
                       <input
@@ -550,10 +611,22 @@ export default function TryOnPage() {
                       </div>
 
                       <div className="mt-4 flex flex-wrap gap-2">
-                        <PresetChip label="Corto" onClick={() => setLength01(0.15)} />
-                        <PresetChip label="Natural" onClick={() => setLength01(0.30)} />
-                        <PresetChip label="Medio" onClick={() => setLength01(0.45)} />
-                        <PresetChip label="Largo" onClick={() => setLength01(0.65)} />
+                        <PresetChip
+                          label="Corto"
+                          onClick={() => setLength01(0.15)}
+                        />
+                        <PresetChip
+                          label="Natural"
+                          onClick={() => setLength01(0.3)}
+                        />
+                        <PresetChip
+                          label="Medio"
+                          onClick={() => setLength01(0.45)}
+                        />
+                        <PresetChip
+                          label="Largo"
+                          onClick={() => setLength01(0.65)}
+                        />
                         <PresetChip label="XL" onClick={() => setLength01(0.85)} />
                       </div>
                     </div>
@@ -563,19 +636,24 @@ export default function TryOnPage() {
                 {tab === "settings" && (
                   <div className="space-y-3">
                     <div className="text-sm text-white/70">
-                      Consejos: activá <b>Freeze</b> para ajustar con la mano quieta.
+                      Consejos: activá <b>Freeze</b> para ajustar con la mano
+                      quieta.
                     </div>
 
                     <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
                       <div className="flex items-center justify-between">
                         <div>
                           <div className="text-sm font-semibold">Freeze</div>
-                          <div className="text-xs text-white/60">Congela la imagen para ajustar sin moverte</div>
+                          <div className="text-xs text-white/60">
+                            Congela la imagen para ajustar sin moverte
+                          </div>
                         </div>
                         <button
                           onClick={onToggleFreeze}
                           className={`rounded-xl px-3 py-2 text-xs font-semibold border border-white/10 ${
-                            isFreeze ? "bg-emerald-500/90 text-black" : "bg-zinc-900/70 text-white"
+                            isFreeze
+                              ? "bg-emerald-500/90 text-black"
+                              : "bg-zinc-900/70 text-white"
                           }`}
                         >
                           {isFreeze ? "ON" : "OFF"}
