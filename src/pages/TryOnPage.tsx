@@ -10,8 +10,8 @@ type Catalog = { designs: Design[] };
 type TabKey = "designs" | "length" | "settings";
 
 const FINGER_TIPS = [
-  { tip: 4, dip: 3 },   // thumb
-  { tip: 8, dip: 7 },   // index
+  { tip: 4, dip: 3 }, // thumb
+  { tip: 8, dip: 7 }, // index
   { tip: 12, dip: 11 }, // middle
   { tip: 16, dip: 15 }, // ring
   { tip: 20, dip: 19 }, // pinky
@@ -38,7 +38,6 @@ export default function TryOnPage() {
 
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [selectedDesignId, setSelectedDesignId] = useState<string | null>(null);
-
   const selectedDesign = useMemo(
     () =>
       catalog?.designs?.find((d) => d.id === selectedDesignId) ??
@@ -65,8 +64,18 @@ export default function TryOnPage() {
   const landmarkerRef = useRef<any>(null);
   const rafRef = useRef<number | null>(null);
 
+  // ✅ Loop gate (no stale closure)
+  const readyRef = useRef(false);
+
   // smoothing
   const smRef = useRef<Record<string, number | null>>({});
+
+  // ✅ Monotonic timestamp for MediaPipe (fixes "Packet timestamp mismatch")
+  const tsRef = useRef(0);
+  const lastPerfRef = useRef(0);
+
+  // ✅ Lost-hand counter to soft-reset timestamps after a while
+  const lostRef = useRef(0);
 
   useEffect(() => {
     (async () => {
@@ -86,13 +95,11 @@ export default function TryOnPage() {
     setStatus("loading");
 
     try {
-      // ✅ cámara estable en desktop + mobile
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          frameRate: { ideal: 30, max: 30 },
-          // En mobile podés volver a activarlo si querés trasera sí o sí:
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          // En mobile podés forzar trasera si querés:
           // facingMode: "environment",
         },
         audio: false,
@@ -100,8 +107,9 @@ export default function TryOnPage() {
 
       videoRef.current.srcObject = stream;
 
-      // ✅ esperar a que el video tenga dimensiones reales (clave)
       await videoRef.current.play();
+
+      // ✅ wait until video has real dimensions
       await new Promise<void>((resolve) => {
         const v = videoRef.current!;
         if (v.readyState >= 2 && v.videoWidth > 0) return resolve();
@@ -116,10 +124,18 @@ export default function TryOnPage() {
         freezeCanvasRef.current = document.createElement("canvas");
       }
 
+      // reset loop + timestamps
+      stopLoop();
+      readyRef.current = true;
+      tsRef.current = 0;
+      lastPerfRef.current = 0;
+      lostRef.current = 0;
+
       setStatus("ready");
       loop();
     } catch (e: any) {
       console.error(e);
+      readyRef.current = false;
       setStatus("error");
     }
   }
@@ -139,6 +155,7 @@ export default function TryOnPage() {
 
   useEffect(() => {
     return () => {
+      readyRef.current = false;
       stopLoop();
       cleanupCamera();
     };
@@ -181,22 +198,40 @@ export default function TryOnPage() {
     fctx.drawImage(v, 0, 0, vw, vh);
   }
 
+  function nextMonotonicTimestampMs() {
+    const p = performance.now();
+    if (lastPerfRef.current === 0) lastPerfRef.current = p;
+
+    const delta = p - lastPerfRef.current;
+    lastPerfRef.current = p;
+
+    // clamp delta to avoid huge jumps (tab switch / lag)
+    tsRef.current += Math.min(Math.max(delta, 0), 33);
+
+    return tsRef.current;
+  }
+
+  function softResetTracking() {
+  smRef.current = {};
+  lostRef.current = 0;
+  tsRef.current = 0;
+  lastPerfRef.current = 0;
+}
+
   function loop() {
     rafRef.current = requestAnimationFrame(loop);
 
     const v = videoRef.current;
     const c = canvasRef.current;
     if (!v || !c) return;
-    if (status !== "ready") return;
 
-    // ✅ si el video todavía no está listo, no intentes detectar
+    if (!readyRef.current) return;
     if (v.readyState < 2 || v.videoWidth === 0) return;
 
     ensureCanvasSize();
     const ctx = c.getContext("2d");
     if (!ctx) return;
 
-    // base image: freeze o video
     ctx.clearRect(0, 0, c.width, c.height);
 
     if (isFreeze && freezeCanvasRef.current) {
@@ -205,23 +240,42 @@ export default function TryOnPage() {
       drawFrameToCanvas(ctx);
     }
 
-    // tracking
     const landmarker = landmarkerRef.current;
     if (!landmarker) return;
 
-    // ✅ timestamp correcto para MediaPipe (CLAVE)
-    const nowMs = v.currentTime * 1000;
-    const res = detectHands(landmarker, v, nowMs);
+    // ✅ monotonic timestamp fixes MediaPipe graph errors
+    const nowMs = nextMonotonicTimestampMs();
+
+    let res: ReturnType<typeof detectHands> | null = null;
+
+    try {
+      res = detectHands(landmarker, v, nowMs);
+    } catch (e) {
+      // If MediaPipe throws (rare), reset timestamps and keep running
+      tsRef.current = 0;
+      lastPerfRef.current = 0;
+      res = null;
+    }
 
     if (!res) {
+      lostRef.current += 1;
       if (handDetected !== false) setHandDetected(false);
+
+      // ✅ After ~1s without hand, soft-reset timestamps
+      if (lostRef.current > 30) {
+        tsRef.current = 0;
+        lastPerfRef.current = 0;
+        lostRef.current = 0;
+      }
+
       drawGuide(ctx);
+      drawHud(ctx, false, isFreeze);
       return;
     }
 
+    lostRef.current = 0;
     if (handDetected !== true) setHandDetected(true);
 
-    // landmarks a pixels (con smoothing)
     const ptsPx: V2[] = res.landmarks.map((p, idx) => {
       const keyX = `x${idx}`;
       const keyY = `y${idx}`;
@@ -242,14 +296,15 @@ export default function TryOnPage() {
       dip: ptsPx[f.dip],
     }));
 
-    // overlay nails
     if (nailImg) {
       drawNails2D(ctx, nailImg, fingers, {
-        length01: clamp(length01, 0, 1),
-        baseWidthPx: 48,
-        baseLengthPx: 90,
-        insetPx: 8,
-      });
+      length01: clamp(length01, 0, 1),
+      baseWidthPx: 44,
+      baseLengthPx: 84,
+      insetPx: 12,
+      tipOutsetPx: 1,
+      lateralOffsetPx: 0,
+});
     }
 
     drawHud(ctx, true, isFreeze);
@@ -274,11 +329,7 @@ export default function TryOnPage() {
     ctx.restore();
   }
 
-  function drawHud(
-    ctx: CanvasRenderingContext2D,
-    detected: boolean,
-    freeze: boolean
-  ) {
+  function drawHud(ctx: CanvasRenderingContext2D, detected: boolean, freeze: boolean) {
     ctx.save();
     ctx.globalAlpha = 0.95;
     ctx.fillStyle = "rgba(0,0,0,0.35)";
@@ -295,9 +346,7 @@ export default function TryOnPage() {
 
     ctx.beginPath();
     ctx.arc(380, 53, 10, 0, Math.PI * 2);
-    ctx.fillStyle = detected
-      ? "rgba(60,220,120,0.95)"
-      : "rgba(255,80,80,0.95)";
+    ctx.fillStyle = detected ? "rgba(60,220,120,0.95)" : "rgba(255,80,80,0.95)";
     ctx.fill();
 
     ctx.restore();
@@ -324,7 +373,13 @@ export default function TryOnPage() {
   function onToggleFreeze() {
     setIsFreeze((prev) => {
       const next = !prev;
-      if (next) captureFreezeFrame();
+      if (next) {
+        captureFreezeFrame();
+        // reset monotonic clock to avoid rare jumps
+        tsRef.current = 0;
+        lastPerfRef.current = 0;
+        lostRef.current = 0;
+      }
       return next;
     });
   }
@@ -344,9 +399,7 @@ export default function TryOnPage() {
     <div className="h-full w-full bg-zinc-950 text-white">
       {/* TOP BAR */}
       <div className="fixed top-0 left-0 right-0 z-20 flex items-center justify-between px-4 py-3 bg-gradient-to-b from-black/70 to-transparent">
-        <div className="text-sm font-semibold tracking-wide">
-          probAR • probar-tool
-        </div>
+        <div className="text-sm font-semibold tracking-wide">probAR • probar-tool</div>
         <div className="text-xs text-white/70">
           {status === "ready" ? "Listo" : status === "loading" ? "Cargando…" : ""}
         </div>
@@ -438,7 +491,15 @@ export default function TryOnPage() {
                       {(catalog?.designs ?? []).map((d) => (
                         <button
                           key={d.id}
-                          onClick={() => setSelectedDesignId(d.id)}
+                          onClick={() => {
+                            setSelectedDesignId(d.id);
+
+                            // ✅ soft reset para que no se "pegue" al cambiar diseño
+                            smRef.current = {};
+                            lostRef.current = 0;
+                            tsRef.current = 0;
+                            lastPerfRef.current = 0;
+                          }}
                           className={`rounded-2xl border p-2 text-left transition ${
                             selectedDesign?.id === d.id
                               ? "border-white/50 bg-white/10"

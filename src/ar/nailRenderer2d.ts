@@ -2,13 +2,14 @@ import type { V2 } from "./geometry";
 import { len, norm, sub, add, mul, clamp } from "./geometry";
 
 export type NailRenderOpts = {
-  // slider: 0..1
   length01: number;
-  // control visual
-  baseWidthPx: number;   // ancho base de uña en px
-  baseLengthPx: number;  // largo base de uña en px
-  // pequeño offset para “meter” uña sobre el dedo
+  baseWidthPx: number;
+  baseLengthPx: number;
   insetPx: number;
+
+  // ✅ opcionales (si no los pasás, se usan 0)
+  tipOutsetPx?: number;
+  lateralOffsetPx?: number;
 };
 
 type FingerTipPair = {
@@ -24,36 +25,45 @@ export function drawNails2D(
 ) {
   if (!nailImg.complete || nailImg.naturalWidth === 0) return;
 
-  for (const f of fingers) {
+  const tipOutset = opts.tipOutsetPx ?? 0;
+  const lateralOffset = opts.lateralOffsetPx ?? 0;
+
+  for (let i = 0; i < fingers.length; i++) {
+    const f = fingers[i];
+
     const dir = sub(f.tip, f.dip);
     const d = len(dir);
-    if (d < 2) continue;
+    if (d < 8) continue;
 
     const u = norm(dir);
+    const perp = { x: -u.y, y: u.x };
 
-    // Angulo: queremos que el PNG “mire” hacia fuera del dedo.
-    // Asumimos que el PNG está orientado vertical (arriba = punta).
-    // Rotamos para alinear +Y del PNG con la dirección del dedo.
-    // En canvas, 0 rad apunta a +X, por eso usamos atan2.
     const angle = Math.atan2(u.y, u.x) + Math.PI / 2;
 
-    // Largo visual: base + extra según slider
-    const extra = 1.6; // cuánto estira como máx (ajustable)
-    const lengthScale = 0.7 + opts.length01 * extra;
+    const extra = 1.6;
+    const lengthScale = 0.7 + clamp(opts.length01, 0, 1) * extra;
 
-    const w = opts.baseWidthPx * clamp(0.85 + (d / 120) * 0.25, 0.75, 1.25);
-    const h = opts.baseLengthPx * lengthScale * clamp(0.85 + (d / 140) * 0.35, 0.75, 1.35);
+    const fingerWidthFactor = [1.15, 1.0, 1.0, 0.95, 0.9][i] ?? 1.0;
 
-    // Punto de anclaje: un poquito “adentro” del tip hacia el dip
-    const anchor = add(f.tip, mul(u, -opts.insetPx));
+    const w =
+      opts.baseWidthPx *
+      fingerWidthFactor *
+      clamp(0.85 + (d / 120) * 0.25, 0.75, 1.25);
+
+    const h =
+      opts.baseLengthPx *
+      lengthScale *
+      clamp(0.85 + (d / 140) * 0.35, 0.75, 1.35);
+
+    const anchor = add(
+      add(f.tip, mul(u, -opts.insetPx + tipOutset)),
+      mul(perp, lateralOffset)
+    );
 
     ctx.save();
     ctx.translate(anchor.x, anchor.y);
     ctx.rotate(angle);
-
-    // dibujamos centrado en X y con base tocando el anclaje
     ctx.drawImage(nailImg, -w / 2, -h, w, h);
-
     ctx.restore();
   }
 }
